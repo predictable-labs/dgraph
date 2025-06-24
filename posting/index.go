@@ -1464,7 +1464,6 @@ func (vc *vectorCentroids) updateCentroids() {
 func (vc *vectorCentroids) randomInit() {
 	vc.dimension = len(vc.centroids[0])
 	vc.numCenters = len(vc.centroids)
-	vc.centroids = make([][]float32, vc.numCenters)
 	vc.counts = make([]int64, vc.numCenters)
 	vc.weights = make([][]float32, vc.numCenters)
 	vc.mutexs = make([]*sync.Mutex, vc.numCenters)
@@ -1484,6 +1483,7 @@ const numCentroids = 1000
 func rebuildVectorIndex(ctx context.Context, factorySpecs []*tok.FactoryCreateSpec, rb *IndexRebuild) error {
 	pk := x.ParsedKey{Attr: rb.Attr}
 	vc := &vectorCentroids{}
+	vc.centroids = make([][]float32, 0)
 
 	MemLayerInstance.IterateDisk(ctx, IterateDiskArgs{
 		Prefix:      pk.DataPrefix(),
