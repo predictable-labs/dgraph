@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"math"
 	"strconv"
 	"sync"
@@ -112,6 +113,11 @@ func (ir *incrRollupi) rollUpKey(writer *TxnWriter, key []byte) error {
 	l, err := GetNoStore(key, ts)
 	if err != nil {
 		return err
+	}
+
+	if EnableDetailedMetrics {
+		pk, _ := x.Parse(key)
+		fmt.Printf("[ROLLUP] Key: %+v, List committedUids address: %p, contents: %v\n", pk, l.mutationMap.committedUids, l.mutationMap.committedUids)
 	}
 
 	kvs, err := l.Rollup(nil, ts)
@@ -276,8 +282,11 @@ func (txn *Txn) CommitToDisk(writer *TxnWriter, commitTs uint64) error {
 	defer cache.Unlock()
 
 	var keys []string
-	for key := range cache.deltas {
+	if err := cache.deltas.IterateKeys(func(key string) error {
 		keys = append(keys, key)
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	defer func() {
@@ -296,9 +305,20 @@ func (txn *Txn) CommitToDisk(writer *TxnWriter, commitTs uint64) error {
 		err := writer.update(commitTs, func(btxn *badger.Txn) error {
 			for ; idx < len(keys); idx++ {
 				key := keys[idx]
-				data := cache.deltas[key]
-				if len(data) == 0 {
+				data, ok := cache.deltas.GetBytes(key)
+				if !ok || data == nil {
 					continue
+				}
+				pl := &pb.PostingList{}
+				if err := proto.Unmarshal(data, pl); err != nil {
+					return err
+				}
+				if len(pl.Postings) == 0 {
+					continue
+				}
+				if EnableDetailedMetrics {
+					pk, _ := x.Parse([]byte(key))
+					fmt.Println("COMMITTING", pk, pl)
 				}
 				if ts := cache.maxVersions[key]; ts >= commitTs {
 					// Skip write because we already have a write at a higher ts.
@@ -362,6 +382,15 @@ func (c *Cache) get(key []byte) (*CachePL, bool) {
 		return nil, false
 	}
 	c.numCacheRead.Add(1)
+	if EnableDetailedMetrics {
+		// Check if the cached list's key matches the requested key
+		requestedKey, _ := x.Parse(key)
+		cachedKey, _ := x.Parse(val.list.key)
+		if requestedKey.Uid != cachedKey.Uid || requestedKey.Attr != cachedKey.Attr {
+			fmt.Printf("[CACHE_MISMATCH] Requested: %+v (bytes: %v), but cache returned: %+v (list.key bytes: %v), list address: %p\n", requestedKey, key, cachedKey, val.list.key, val.list)
+			panic("CACHE_MISMATCH")
+		}
+	}
 	return val, true
 }
 
@@ -370,6 +399,18 @@ func (c *Cache) set(key []byte, i *CachePL) {
 		return
 	}
 	c.numCacheSave.Add(1)
+	if EnableDetailedMetrics {
+		// Verify that the key being cached matches the list's key
+		if i.list != nil {
+			requestedKey, _ := x.Parse(key)
+			listKey, _ := x.Parse(i.list.key)
+			if requestedKey.Uid != listKey.Uid || requestedKey.Attr != listKey.Attr {
+				fmt.Printf("[CACHE_SET_MISMATCH] Trying to cache key %+v with list that has key %+v, list address: %p\n", requestedKey, listKey, i.list)
+				panic("CACHE_SET_MISMATCH")
+			}
+			fmt.Printf("[CACHE_SET] Key: %+v (bytes: %v), list address: %p, list.key bytes: %v, committedUids address: %p\n", requestedKey, key, i.list, i.list.key, i.list.mutationMap.committedUids)
+		}
+	}
 	c.data.Set(key, i, 1)
 }
 
@@ -482,7 +523,8 @@ func (ml *MemoryLayer) IterateDisk(ctx context.Context, f IterateDiskArgs) error
 		if err != nil {
 			return err
 		}
-		empty, err := l.IsEmpty(f.ReadTs, 0)
+		empty, err := false, nil
+		//empty, err := l.IsEmpty(f.ReadTs, 0)
 		switch {
 		case err != nil:
 			return err
@@ -567,7 +609,7 @@ func (ml *MemoryLayer) wait() {
 	ml.cache.wait()
 }
 
-func (ml *MemoryLayer) updateItemInCache(key string, delta []byte, startTs, commitTs uint64) {
+func (ml *MemoryLayer) updateItemInCache(key string, delta *pb.PostingList, startTs, commitTs uint64) {
 	if commitTs == 0 {
 		return
 	}
@@ -579,24 +621,27 @@ func (ml *MemoryLayer) updateItemInCache(key string, delta []byte, startTs, comm
 	}
 
 	val, ok := ml.cache.get([]byte(key))
-	if !ok {
-		return
-	}
 
-	val.lastUpdate = commitTs
+	if ok && val.list != nil && val.list.minTs <= commitTs {
+		val.lastUpdate = commitTs
 
-	if val.list != nil {
-		p := new(pb.PostingList)
-		x.Check(proto.Unmarshal(delta, p))
-
-		if p.Pack == nil {
-			val.list.setMutationAfterCommit(startTs, commitTs, p, true)
-			checkForRollup([]byte(key), val.list)
-		} else {
-			// Data was rolled up. TODO figure out how is UpdateCachedKeys getting delta which is pack)
-			ml.del([]byte(key))
+		if val.list != nil {
+			if delta.Pack == nil {
+				if EnableDetailedMetrics {
+					pk, _ := x.Parse([]byte(key))
+					fmt.Println("UPDATING CACHE", pk, "before update committedUids:", val.list.mutationMap.committedUids)
+				}
+				val.list.setMutationAfterCommit(startTs, commitTs, delta, true)
+				if EnableDetailedMetrics {
+					pk, _ := x.Parse([]byte(key))
+					fmt.Println("UPDATING CACHE", pk, "after update committedUids:", val.list.mutationMap.committedUids)
+				}
+				checkForRollup([]byte(key), val.list)
+			} else {
+				// Data was rolled up. TODO figure out how is UpdateCachedKeys getting delta which is pack)
+				ml.del([]byte(key))
+			}
 		}
-
 	}
 }
 
@@ -607,8 +652,11 @@ func (txn *Txn) UpdateCachedKeys(commitTs uint64) {
 	}
 
 	MemLayerInstance.wait()
-	for key, delta := range txn.cache.deltas {
-		MemLayerInstance.updateItemInCache(key, delta, txn.StartTs, commitTs)
+	if err := txn.cache.deltas.IteratePostings(func(key string, value *pb.PostingList) error {
+		MemLayerInstance.updateItemInCache(key, value, txn.StartTs, commitTs)
+		return nil
+	}); err != nil {
+		glog.Errorf("UpdateCachedKeys: error while iterating deltas: %v", err)
 	}
 }
 
@@ -712,6 +760,9 @@ func ReadPostingList(key []byte, it *badger.Iterator) (*List, error) {
 				}
 				pl.CommitTs = item.Version()
 				l.mutationMap.insertCommittedPostings(pl)
+				if EnableDetailedMetrics {
+					fmt.Println("Building committed uids", pk, l.mutationMap.committedUids)
+				}
 				return nil
 			})
 			if err != nil {
@@ -736,14 +787,17 @@ func ReadPostingList(key []byte, it *badger.Iterator) (*List, error) {
 
 func copyList(l *List) *List {
 	l.AssertRLock()
-	// No need to clone the immutable layer or the key since mutations will not modify it.
+	// Make a deep copy of the key to prevent the underlying byte array from being modified
+	keyCopy := make([]byte, len(l.key))
+	copy(keyCopy, l.key)
+
 	lCopy := &List{
 		minTs: l.minTs,
 		maxTs: l.maxTs,
-		key:   l.key,
+		key:   keyCopy,
 		plist: l.plist,
 	}
-	lCopy.mutationMap = l.mutationMap.clone()
+	lCopy.mutationMap = l.mutationMap.clone(keyCopy)
 	return lCopy
 }
 
@@ -758,7 +812,15 @@ func (ml *MemoryLayer) readFromCache(key []byte, readTs uint64) *List {
 
 	if ok && cacheItem.list != nil && cacheItem.list.minTs <= readTs {
 		cacheItem.list.RLock()
+		if EnableDetailedMetrics {
+			pk, _ := x.Parse(key)
+			fmt.Printf("[READ_CACHE] Key: %+v, Original list committedUids address: %p, contents: %v\n", pk, cacheItem.list.mutationMap.committedUids, cacheItem.list.mutationMap.committedUids)
+		}
 		lCopy := copyList(cacheItem.list)
+		if EnableDetailedMetrics {
+			pk, _ := x.Parse(key)
+			fmt.Printf("[READ_CACHE] Key: %+v, Copied list committedUids address: %p, contents: %v\n", pk, lCopy.mutationMap.committedUids, lCopy.mutationMap.committedUids)
+		}
 		cacheItem.list.RUnlock()
 		checkForRollup(key, lCopy)
 		return lCopy
@@ -794,6 +856,10 @@ func (ml *MemoryLayer) readFromDisk(key []byte, pstore *badger.DB, readTs uint64
 func (ml *MemoryLayer) saveInCache(key []byte, l *List) {
 	l.RLock()
 	defer l.RUnlock()
+	if EnableDetailedMetrics {
+		pk, _ := x.Parse(key)
+		fmt.Println("SAVING TO CACHE", pk, "committedUids:", l.mutationMap.committedUids)
+	}
 	cacheItem := NewCachePL()
 	cacheItem.list = copyList(l)
 	cacheItem.lastUpdate = l.maxTs

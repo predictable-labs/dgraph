@@ -462,6 +462,10 @@ func (qs *queryState) handleValuePostings(ctx context.Context, args funcArgs) er
 						Value: p.Value,
 					}
 				}
+				if posting.EnableDetailedMetrics {
+					pk, _ := x.Parse(key)
+					fmt.Println("READING SINGLE", pk, vals, pl)
+				}
 			} else {
 				pl, err := qs.cache.Get(key)
 				if err != nil {
@@ -481,6 +485,10 @@ func (qs *queryState) handleValuePostings(ctx context.Context, args funcArgs) er
 				}
 
 				vals, fcs, err = retrieveValuesAndFacets(args, pl, facetsTree, listType)
+				if posting.EnableDetailedMetrics {
+					pk, _ := x.Parse(key)
+					fmt.Println("READING", pk, vals, fcs, pl.Print())
+				}
 
 				switch {
 				case err == posting.ErrNoValue || (err == nil && len(vals) == 0):
@@ -2701,6 +2709,9 @@ func (qs *queryState) handleHasFunction(ctx context.Context, q *pb.Query, out *p
 	}
 	span.AddEvent("handleHasFunction result", trace.WithAttributes(
 		attribute.Int("uid_count", len(result.Uids))))
+	if posting.EnableDetailedMetrics {
+		fmt.Printf("[DEBUG handleHasFunction] attr=%s, collected UIDs in order: %v\n", q.Attr, result.Uids)
+	}
 	out.UidMatrix = append(out.UidMatrix, result)
 	return nil
 }
