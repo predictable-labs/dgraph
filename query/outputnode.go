@@ -29,6 +29,7 @@ import (
 	"github.com/dgraph-io/ristretto/v2/z"
 	"github.com/hypermodeinc/dgraph/v25/algo"
 	gqlSchema "github.com/hypermodeinc/dgraph/v25/graphql/schema"
+	"github.com/hypermodeinc/dgraph/v25/posting"
 	"github.com/hypermodeinc/dgraph/v25/protos/pb"
 	"github.com/hypermodeinc/dgraph/v25/task"
 	"github.com/hypermodeinc/dgraph/v25/types"
@@ -1382,6 +1383,10 @@ func (sg *SubGraph) preTraverse(enc *encoder, uid uint64, dst fastJsonNode) erro
 		}
 
 		idx := algo.IndexOf(pc.SrcUIDs, uid)
+		if pc.Attr == "name" && len(pc.valueMatrix) > 0 && posting.EnableDetailedMetrics {
+			fmt.Printf("[DEBUG preTraverse] attr=%s uid=%d idx=%d SrcUIDs=%v valueMatrix[0]=%v\n",
+				pc.Attr, uid, idx, pc.SrcUIDs.Uids, pc.valueMatrix[0])
+		}
 		if idx < 0 {
 			continue
 		}

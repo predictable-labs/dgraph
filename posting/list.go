@@ -130,11 +130,15 @@ func (mm *MutableLayer) setTs(readTs uint64) {
 // things from the existing mutable layer for the new list. It basically copies committedEntries using reference and
 // ignores currentEntires and readTs. Similarly, all the cache items related to currentEntries are ignored and
 // committedEntries are presevred for the new list.
-func (mm *MutableLayer) clone() *MutableLayer {
+func (mm *MutableLayer) clone(key []byte) *MutableLayer {
 	if mm == nil {
 		return nil
 	}
-	return &MutableLayer{
+	if EnableDetailedMetrics {
+		pk, _ := x.Parse(key)
+		fmt.Printf("[CLONE] Key: %+v, Original committedUids map address: %p, contents: %v\n", pk, mm.committedUids, mm.committedUids)
+	}
+	cloned := &MutableLayer{
 		committedEntries:  mm.committedEntries,
 		readTs:            0,
 		deleteAllMarker:   mm.deleteAllMarker,
@@ -145,6 +149,11 @@ func (mm *MutableLayer) clone() *MutableLayer {
 		isUidsCalculated:  mm.isUidsCalculated,
 		calculatedUids:    mm.calculatedUids,
 	}
+	if EnableDetailedMetrics {
+		pk, _ := x.Parse(key)
+		fmt.Printf("[CLONE] Key: %+v, Cloned committedUids map address: %p, contents: %v\n", pk, cloned.committedUids, cloned.committedUids)
+	}
+	return cloned
 }
 
 // setCurrentEntires() sets the posting in currentEntries. It's used to overwrite the currentEntires. It empties the
@@ -335,6 +344,9 @@ func (mm *MutableLayer) insertCommittedPostings(pl *pb.PostingList) {
 		// We insert old postings in reverse order. So we only need to read the first update to an UID.
 		if _, ok := mm.committedUids[mpost.Uid]; !ok {
 			mm.committedUids[mpost.Uid] = mpost
+			if EnableDetailedMetrics {
+				fmt.Println("Building committed uids", mm.committedUids, mpost)
+			}
 		}
 	}
 }
@@ -404,13 +416,18 @@ func (mm *MutableLayer) print() string {
 	if mm == nil {
 		return ""
 	}
-	return fmt.Sprintf("Committed List: %+v Proposed list: %+v Delete all marker: %d  \n",
+	return fmt.Sprintf("Committed List: %+v Proposed list: %+v Delete all marker: %d. Count: %d  \n",
 		mm.committedEntries,
 		mm.currentEntries,
-		mm.deleteAllMarker)
+		mm.deleteAllMarker,
+		mm.length)
 }
 
 func (l *List) Print() string {
+	if l.plist.Pack != nil {
+		uids := codec.Decode(l.plist.Pack, 0)
+		return fmt.Sprintf("minTs: %d, committed uids: %+v, mutationMap: %s", l.minTs, uids, l.mutationMap.print())
+	}
 	return fmt.Sprintf("minTs: %d, plist: %+v, mutationMap: %s", l.minTs, l.plist, l.mutationMap.print())
 }
 
@@ -712,6 +729,53 @@ type ListOptions struct {
 	First     int
 }
 
+func NewPostingExisting(p *pb.Posting, t *pb.DirectedEdge) {
+	var op uint32
+	switch t.Op {
+	case pb.DirectedEdge_SET:
+		op = Set
+	case pb.DirectedEdge_OVR:
+		op = Ovr
+	case pb.DirectedEdge_DEL:
+		op = Del
+	default:
+		x.Fatalf("Unhandled operation: %+v", t)
+	}
+
+	var postingType pb.Posting_PostingType
+	switch {
+	case len(t.Lang) > 0:
+		postingType = pb.Posting_VALUE_LANG
+	case t.ValueId == 0:
+		postingType = pb.Posting_VALUE
+	default:
+		postingType = pb.Posting_REF
+	}
+
+	p.Uid = t.ValueId
+	p.Value = t.Value
+	p.ValType = t.ValueType
+	p.PostingType = postingType
+	p.LangTag = []byte(t.Lang)
+	p.Op = op
+	p.Facets = t.Facets
+}
+
+func GetPostingOp(top uint32) pb.DirectedEdge_Op {
+	var op pb.DirectedEdge_Op
+	switch top {
+	case Set:
+		op = pb.DirectedEdge_SET
+	case Del:
+		op = pb.DirectedEdge_DEL
+	case Ovr:
+		op = pb.DirectedEdge_OVR
+	default:
+		x.Fatalf("Unhandled operation: %+v", top)
+	}
+	return op
+}
+
 // NewPosting takes the given edge and returns its equivalent representation as a posting.
 func NewPosting(t *pb.DirectedEdge) *pb.Posting {
 	var op uint32
@@ -789,12 +853,12 @@ func (l *List) updateMutationLayer(mpost *pb.Posting, singleUidUpdate, hasCountI
 		// The current value should be deleted in favor of this value. This needs to
 		// be done because the fingerprint for the value is not math.MaxUint64 as is
 		// the case with the rest of the scalar predicates.
-		newPlist := &pb.PostingList{}
-		if mpost.Op != Del {
-			// If we are setting a new value then we can just delete all the older values.
-			newPlist.Postings = append(newPlist.Postings, createDeleteAllPosting())
+		newPlist := &pb.PostingList{
+			Postings: []*pb.Posting{createDeleteAllPosting()},
 		}
-		newPlist.Postings = append(newPlist.Postings, mpost)
+		if mpost.Op != Del {
+			newPlist.Postings = append(newPlist.Postings, mpost)
+		}
 		l.mutationMap.setCurrentEntries(mpost.StartTs, newPlist)
 		return nil
 	}
@@ -831,6 +895,10 @@ func fingerprintEdge(t *pb.DirectedEdge) uint64 {
 		id = farm.Fingerprint64(t.Value)
 	}
 	return id
+}
+
+func FingerprintEdge(t *pb.DirectedEdge) uint64 {
+	return fingerprintEdge(t)
 }
 
 func (l *List) addMutation(ctx context.Context, txn *Txn, t *pb.DirectedEdge) error {
@@ -1010,9 +1078,12 @@ func (l *List) setMutationAfterCommit(startTs, commitTs uint64, pl *pb.PostingLi
 	if refresh {
 		newMap := make(map[uint64]*pb.Posting, len(l.mutationMap.committedUids))
 		for uid, post := range l.mutationMap.committedUids {
-			newMap[uid] = post
+			newMap[uid] = proto.Clone(post).(*pb.Posting)
 		}
 		l.mutationMap.committedUids = newMap
+		// Reset calculated UIDs cache since we're creating new maps
+		l.mutationMap.isUidsCalculated = false
+		l.mutationMap.calculatedUids = nil
 	}
 
 	for _, mpost := range pl.Postings {
@@ -1022,7 +1093,7 @@ func (l *List) setMutationAfterCommit(startTs, commitTs uint64, pl *pb.PostingLi
 			continue
 		}
 
-		l.mutationMap.committedUids[mpost.Uid] = mpost
+		l.mutationMap.committedUids[mpost.Uid] = proto.Clone(mpost).(*pb.Posting)
 		if l.mutationMap.length == math.MaxInt64 {
 			l.mutationMap.length = 0
 		}
@@ -1043,6 +1114,12 @@ func (l *List) setMutationAfterCommit(startTs, commitTs uint64, pl *pb.PostingLi
 func (l *List) setMutation(startTs uint64, data []byte) {
 	pl := new(pb.PostingList)
 	x.Check(proto.Unmarshal(data, pl))
+	l.setMutationWithPosting(startTs, pl)
+}
+
+func (l *List) setMutationWithPosting(startTs uint64, pl *pb.PostingList) {
+	// pk, _ := x.Parse(l.key)
+	// fmt.Println("Setting mutation for ", l.key, pk, pl)
 
 	l.Lock()
 	if l.mutationMap == nil {
@@ -1110,6 +1187,13 @@ func (l *List) pickPostings(readTs uint64) (uint64, []*pb.Posting) {
 		}
 		return pi.Uid < pj.Uid
 	})
+
+	if len(posts) > 0 {
+		if hasDeleteAll(posts[0]) {
+			posts = posts[1:]
+		}
+	}
+
 	return deleteAllMarker, posts
 }
 
@@ -1196,7 +1280,9 @@ loop:
 		case pp.Uid == 0 || (mp.Uid > 0 && mp.Uid < pp.Uid):
 			// Either pp is empty, or mp is lower than pp.
 			if mp.Op != Del {
-				err = f(mp)
+				// Clone the posting before passing to callback to prevent sharing
+				mpCopy := proto.Clone(mp).(*pb.Posting)
+				err = f(mpCopy)
 				numNormalPostingsRead += 1
 				if err != nil {
 					break loop
@@ -1208,7 +1294,9 @@ loop:
 			midx++
 		case pp.Uid == mp.Uid:
 			if mp.Op != Del {
-				err = f(mp)
+				// Clone the posting before passing to callback to prevent sharing
+				mpCopy := proto.Clone(mp).(*pb.Posting)
+				err = f(mpCopy)
 				numNormalPostingsRead += 1
 				if err != nil {
 					break loop
@@ -1257,6 +1345,11 @@ func (l *List) GetLength(readTs uint64) int {
 		}
 		length += immutLen
 	}
+
+	// pureLength := l.length(readTs, 0)
+	// if pureLength != length {
+	// 	panic(fmt.Sprintf("pure length != length %d %d %s", pureLength, length, l.Print()))
+	// }
 
 	return length
 }
@@ -1451,9 +1544,17 @@ func (l *List) Rollup(alloc *z.Allocator, readTs uint64) ([]*bpb.KV, error) {
 		return bytes.Compare(kvs[i].Key, kvs[j].Key) <= 0
 	})
 
-	x.PrintRollup(out.plist, out.parts, l.key, kv.Version)
+	PrintRollup(out.plist, out.parts, l.key, kv.Version)
 	x.VerifyPostingSplits(kvs, out.plist, out.parts, l.key)
 	return kvs, nil
+}
+
+func PrintRollup(plist *pb.PostingList, parts map[uint64]*pb.PostingList, baseKey []byte, ts uint64) {
+	if EnableDetailedMetrics {
+		k, _ := x.Parse(baseKey)
+		uids := codec.Decode(plist.Pack, 0)	
+		fmt.Printf("[TXNLOG] DOING ROLLUP for key: %+v at timestamp: %v, uids: %+v\n", k, ts, uids)
+	}
 }
 
 // ToBackupPostingList uses rollup to generate a single list with no splits.
@@ -2006,6 +2107,18 @@ func (l *List) findStaticValue(readTs uint64) *pb.PostingList {
 	// means we need to return l.plist
 	if l.plist != nil && len(l.plist.Postings) > 0 {
 		return l.plist
+	}
+	if l.plist != nil && l.plist.Pack != nil {
+		uids := codec.Decode(l.plist.Pack, 0)
+		return &pb.PostingList{
+			Postings: []*pb.Posting{
+				{
+					Uid:     uids[0],
+					ValType: pb.Posting_UID,
+					Op:      Set,
+				},
+			},
+		}
 	}
 	return nil
 }
