@@ -14,7 +14,89 @@ import (
 	"github.com/hypermodeinc/dgraph/v25/protos/pb"
 )
 
-const sizeOfBucket = 144
+const sizeOfBucket = 14
+
+func (l *List) ApproximateSize() uint64 {
+	if l == nil {
+		return 0
+	}
+
+	l.RLock()
+	defer l.RUnlock()
+
+	var size uint64 = 4*8 + // safe mutex consists of 4 words.
+		1*8 + // plist pointer consists of 1 word.
+		1*8 + // mutation map pointer  consists of 1 word.
+		2*8 + // minTs and maxTs take 1 word each.
+		3*8 + // array take 3 words. so key array is 3 words.
+		1*8 // So far 11 words, in order to round the slab we're adding one more word.
+	// so far basic struct layout has been calculated.
+
+	// Add each entry size of key array.
+	size += uint64(cap(l.key))
+
+	size += approxPostingListSize(l.plist)
+
+	return size
+}
+
+func approxPostingListSize(list *pb.PostingList) uint64 {
+	if list == nil {
+		return 0
+	}
+
+	var size uint64 = 1*8 + // Pack consists of 1 word.
+		3*8 + // Postings array consists of 3 words.
+		1*8 + // CommitTs consists of 1 word.
+		3*8 // Splits array consists of 3 words.
+
+	// add pack size.
+	size += calculatePackSize(list.Pack)
+
+	// Each entry take one word.
+	// Adding each entry reference allocation.
+	size += uint64(cap(list.Postings)) * 8
+	for _, p := range list.Postings {
+		// add the size of each posting.
+		size += calculatePostingSize(p) * uint64(len(list.Postings))
+		break
+	}
+
+	// Each entry take one word.
+	// Adding each entry size.
+	size += uint64(cap(list.Splits)) * 8
+
+	return size
+}
+
+func (m *MutableLayer) ApproximateSize() uint64 {
+	if m == nil {
+		return 0
+	}
+
+	var size uint64 = 2*8 + // committedEntries and currentEntries take 2 words each.
+		1*8 + // readTs takes 1 word.
+		1*8 + // deleteAllMarker takes 1 word.
+		1*8 + // committedUids takes 1 word.
+		1*8 + // committedUidsTime takes 1 word.
+		1*8 + // length takes 1 word.
+		1*8 + // lastEntry takes 1 word.
+		1*8 + // committedUidsTime takes 1 word.
+		1*8 + // isUidsCalculated takes 1 word.
+		1*8 // calculatedUids takes 1 word.
+	// so far basic struct layout has been calculated.
+
+	// Add each entry size of committedEntries.
+	size += uint64(len(m.committedEntries)) * 8
+
+	// Add each entry size of currentEntries.
+	size += uint64(len(m.currentEntries.Postings)) * 8
+
+	// Add each entry size of calculatedUids.
+	size += uint64(len(m.calculatedUids)) * 8
+
+	return size
+}
 
 // DeepSize computes the memory taken by a Posting List
 func (l *List) DeepSize() uint64 {
