@@ -175,6 +175,9 @@ func (mr *dgraphResolver) Resolve(ctx context.Context, m schema.Mutation) (*Reso
 	span := trace.SpanFromContext(ctx)
 	stop := x.SpanTimer(span, "resolveMutation")
 	defer stop()
+
+	glog.Infof("=== [GraphQL Flow] dgraphResolver.Resolve - Mutation: %s, Type: %s, ResponseName: %s ===", m.Name(), m.MutationType(), m.ResponseName())
+
 	if span != nil {
 		span.AddEvent("Mutation Started", trace.WithAttributes(
 			attribute.String("Mutation alias", m.Alias()),
@@ -192,7 +195,9 @@ func (mr *dgraphResolver) Resolve(ctx context.Context, m schema.Mutation) (*Reso
 	timer.Start()
 	defer timer.Stop()
 
+	glog.Infof("=== [GraphQL Flow] dgraphResolver.Resolve - Calling rewriteAndExecute() ===")
 	resolved, success := mr.rewriteAndExecute(ctx, m)
+	glog.Infof("=== [GraphQL Flow] dgraphResolver.Resolve - Completed for %s, success=%v ===", m.Name(), success)
 	resolverTrace.Dgraph = resolved.Extensions.Tracing.Execution.Resolvers[0].Dgraph
 	resolved.Extensions.Tracing.Execution.Resolvers[0] = resolverTrace
 	return resolved, success
@@ -265,8 +270,10 @@ func (mr *dgraphResolver) rewriteAndExecute(
 	// are then executed and the results are processed
 	var queries []*dql.GraphQuery
 	var filterTypes []string
+	glog.Infof("=== [GraphQL Flow] dgraphResolver.rewriteAndExecute - Calling mutationRewriter.RewriteQueries() ===")
 	queries, filterTypes, err = mr.mutationRewriter.RewriteQueries(ctx, mutation)
 	if err != nil {
+		glog.Errorf("=== [GraphQL Flow] dgraphResolver.rewriteAndExecute - Error rewriting queries: %v ===", err)
 		return emptyResult(schema.GQLWrapf(err, "couldn't rewrite mutation %s", mutation.Name())),
 			resolverFailed
 	}
@@ -278,14 +285,17 @@ func (mr *dgraphResolver) rewriteAndExecute(
 	// Don't execute the query in those cases.
 	// The query will also be empty in case this is not an Add or an Update Mutation.
 	if req.Query != "" {
+		glog.Infof("=== [GraphQL Flow] dgraphResolver.rewriteAndExecute - Executing pre-mutation query: %s ===", qry)
 		// Executing and processing existence queries
 		queryTimer := newtimer(ctx, &dgraphPreMutationQueryDuration.OffsetDuration)
 		queryTimer.Start()
 		mutResp, err = mr.executor.Execute(ctx, req, nil)
 		queryTimer.Stop()
+		glog.Infof("=== [GraphQL Flow] dgraphResolver.rewriteAndExecute - Pre-mutation query completed ===")
 		if err != nil {
 			gqlErr := schema.GQLWrapLocationf(
 				err, mutation.Location(), "mutation %s failed", mutation.Name())
+			glog.Errorf("=== [GraphQL Flow] dgraphResolver.rewriteAndExecute - Pre-mutation query failed: %v ===", err)
 			return emptyResult(gqlErr), resolverFailed
 		}
 		ext.TouchedUids += mutResp.GetMetrics().GetNumUids()[touchedUidsKey]
@@ -361,12 +371,15 @@ func (mr *dgraphResolver) rewriteAndExecute(
 	}
 
 	// Create upserts, delete mutations, update mutations, add mutations.
+	glog.Infof("=== [GraphQL Flow] dgraphResolver.rewriteAndExecute - Calling mutationRewriter.Rewrite() ===")
 	upserts, err = mr.mutationRewriter.Rewrite(ctx, mutation, qNameToUID)
 
 	if err != nil {
+		glog.Errorf("=== [GraphQL Flow] dgraphResolver.rewriteAndExecute - Error rewriting mutation: %v ===", err)
 		return emptyResult(schema.GQLWrapf(err, "couldn't rewrite mutation %s", mutation.Name())),
 			resolverFailed
 	}
+	glog.Infof("=== [GraphQL Flow] dgraphResolver.rewriteAndExecute - Generated %d upserts ===", len(upserts))
 	if len(upserts) == 0 {
 		return &Resolved{
 			Data:       completeMutationResult(mutation, nil, 0),
@@ -407,16 +420,20 @@ func (mr *dgraphResolver) rewriteAndExecute(
 	mutationTimer := newtimer(ctx, &dgraphMutationDuration.OffsetDuration)
 	mutationTimer.Start()
 
-	for _, upsert := range upserts {
+	glog.Infof("=== [GraphQL Flow] dgraphResolver.rewriteAndExecute - Executing %d mutations ===", len(upserts))
+	for idx, upsert := range upserts {
 		req.Query = dgraph.AsString(upsert.Query)
 		req.Mutations = upsert.Mutations
+		glog.Infof("=== [GraphQL Flow] dgraphResolver.rewriteAndExecute - Executing mutation %d/%d ===", idx+1, len(upserts))
 		mutResp, err = mr.executor.Execute(ctx, req, nil)
 		if err != nil {
 			gqlErr := schema.GQLWrapLocationf(
 				err, mutation.Location(), "mutation %s failed", mutation.Name())
+			glog.Errorf("=== [GraphQL Flow] dgraphResolver.rewriteAndExecute - Mutation execution failed: %v ===", err)
 			return emptyResult(gqlErr), resolverFailed
 
 		}
+		glog.Infof("=== [GraphQL Flow] dgraphResolver.rewriteAndExecute - Mutation %d/%d completed ===", idx+1, len(upserts))
 
 		ext.TouchedUids += mutResp.GetMetrics().GetNumUids()[touchedUidsKey]
 		if req.Query != "" && len(mutResp.GetJson()) != 0 {

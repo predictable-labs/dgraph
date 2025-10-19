@@ -68,6 +68,8 @@ func (qr *queryResolver) Resolve(ctx context.Context, query schema.Query) *Resol
 	stop := x.SpanTimer(span, "resolveQuery")
 	defer stop()
 
+	glog.Infof("=== [GraphQL Flow] queryResolver.Resolve - Query: %s, ResponseName: %s ===", query.Name(), query.ResponseName())
+
 	resolverTrace := &schema.ResolverTrace{
 		Path:       []interface{}{query.ResponseName()},
 		ParentType: "Query",
@@ -78,10 +80,13 @@ func (qr *queryResolver) Resolve(ctx context.Context, query schema.Query) *Resol
 	timer.Start()
 	defer timer.Stop()
 
+	glog.Infof("=== [GraphQL Flow] queryResolver.Resolve - Calling rewriteAndExecute() ===")
 	resolved := qr.rewriteAndExecute(ctx, query)
+	glog.Infof("=== [GraphQL Flow] queryResolver.Resolve - Calling resultCompleter.Complete() ===")
 	qr.resultCompleter.Complete(ctx, resolved)
 	resolverTrace.Dgraph = resolved.Extensions.Tracing.Execution.Resolvers[0].Dgraph
 	resolved.Extensions.Tracing.Execution.Resolvers[0] = resolverTrace
+	glog.Infof("=== [GraphQL Flow] queryResolver.Resolve - Completed for %s ===", query.Name())
 	return resolved
 }
 
@@ -110,21 +115,26 @@ func (qr *queryResolver) rewriteAndExecute(ctx context.Context, query schema.Que
 		}
 	}
 
+	glog.Infof("=== [GraphQL Flow] queryResolver.rewriteAndExecute - Calling queryRewriter.Rewrite() ===")
 	dgQuery, err := qr.queryRewriter.Rewrite(ctx, query)
 	if err != nil {
+		glog.Errorf("=== [GraphQL Flow] queryResolver.rewriteAndExecute - Error rewriting query: %v ===", err)
 		return emptyResult(schema.GQLWrapf(err, "couldn't rewrite query %s",
 			query.ResponseName()))
 	}
 	qry := dgraph.AsString(dgQuery)
+	glog.Infof("=== [GraphQL Flow] queryResolver.rewriteAndExecute - Rewritten DQL Query: %s ===", qry)
 
 	queryTimer := newtimer(ctx, &dgraphQueryDuration.OffsetDuration)
 	queryTimer.Start()
+	glog.Infof("=== [GraphQL Flow] queryResolver.rewriteAndExecute - Calling executor.Execute() ===")
 	resp, err := qr.executor.Execute(ctx, &dgoapi.Request{Query: qry, ReadOnly: true}, query)
 	queryTimer.Stop()
+	glog.Infof("=== [GraphQL Flow] queryResolver.rewriteAndExecute - Executor.Execute() completed ===")
 
 	if err != nil && !x.IsGqlErrorList(err) {
 		err = schema.GQLWrapf(err, "Dgraph query failed")
-		glog.Infof("Dgraph query execution failed : %s", err)
+		glog.Errorf("=== [GraphQL Flow] queryResolver.rewriteAndExecute - Dgraph query execution failed : %s ===", err)
 	}
 
 	ext.TouchedUids = resp.GetMetrics().GetNumUids()[touchedUidsKey]
