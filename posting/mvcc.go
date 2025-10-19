@@ -370,7 +370,7 @@ func (c *Cache) set(key []byte, i *CachePL) {
 		return
 	}
 	c.numCacheSave.Add(1)
-	c.data.Set(key, i, int64(i.list.ApproximateSize()))
+	c.data.Set(key, i, 0)
 }
 
 func (c *Cache) del(key []byte) {
