@@ -508,14 +508,17 @@ func initMemoryLayer(cacheSize int64, removeOnUpdate bool) *MemoryLayer {
 	ml.removeOnUpdate = removeOnUpdate
 	ml.statsHolder = NewStatsHolder()
 	if cacheSize > 0 {
-		cache, err := ristretto.NewCache[[]byte, *CachePL](&ristretto.Config[[]byte, *CachePL]{
+		cache, err := ristretto.NewCache(&ristretto.Config[[]byte, *CachePL]{
 			// Use 5% of cache memory for storing counters.
 			NumCounters: int64(float64(cacheSize) * 0.05 * 2),
 			MaxCost:     int64(float64(cacheSize) * 0.95),
 			BufferItems: 16,
 			Metrics:     true,
 			Cost: func(val *CachePL) int64 {
-				return 1
+				if val.list == nil {
+					return 0
+				}
+				return int64(val.list.ApproximateSize())
 			},
 			ShouldUpdate: func(cur, prev *CachePL) bool {
 				return !(cur.list != nil && prev.list != nil && prev.list.maxTs > cur.list.maxTs)
