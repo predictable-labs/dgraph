@@ -451,6 +451,8 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) (
 	stop := x.SpanTimer(span, methodResolve)
 	defer stop()
 
+	glog.Infof("=== [GraphQL Flow] RequestResolver.Resolve - Entry Point ===")
+
 	if r == nil {
 		glog.Errorf("Call to Resolve with nil RequestResolver")
 		return schema.ErrorResponse(errors.New(ErrInternal))
@@ -495,9 +497,12 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) (
 	ctx = x.AttachJWTNamespace(ctx)
 	op, err := r.schema.Operation(gqlReq)
 	if err != nil {
+		glog.Errorf("=== [GraphQL Flow] RequestResolver.Resolve - Error parsing operation: %v ===", err)
 		resp.Errors = schema.AsGQLErrors(err)
 		return
 	}
+
+	glog.Infof("=== [GraphQL Flow] RequestResolver.Resolve - Operation Type: IsQuery=%v, IsMutation=%v, IsSubscription=%v ===", op.IsQuery(), op.IsMutation(), op.IsSubscription())
 
 	if glog.V(3) {
 		// don't log the introspection queries they are sent too frequently
@@ -518,6 +523,11 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) (
 		// Queries run in parallel and are independent of each other: e.g.
 		// an error in one query, doesn't affect the others.
 
+		glog.Infof("=== [GraphQL Flow] RequestResolver.Resolve - Starting query resolution for %d queries ===", len(op.Queries()))
+		for i, q := range op.Queries() {
+			glog.Infof("=== [GraphQL Flow] RequestResolver.Resolve - Query[%d]: Name=%s, Type=%s ===", i, q.Name(), q.Type())
+		}
+
 		var wg sync.WaitGroup
 		allResolved := make([]*Resolved, len(op.Queries()))
 
@@ -534,10 +544,14 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) (
 							Err:   err,
 						}
 					}, gqlReq.Query)
+				glog.Infof("=== [GraphQL Flow] RequestResolver.Resolve - Calling queryResolverFor(%s).Resolve() ===", q.Name())
 				allResolved[storeAt] = r.resolvers.queryResolverFor(q).Resolve(ctx, q)
+				glog.Infof("=== [GraphQL Flow] RequestResolver.Resolve - Completed query resolution for %s ===", q.Name())
 			}(q, i)
 		}
 		wg.Wait()
+		glog.Infof("=== [GraphQL Flow] RequestResolver.Resolve - All queries completed ===")
+
 
 		// The GraphQL data response needs to be written in the same order as the
 		// queries in the request.
@@ -574,9 +588,13 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) (
 		//
 		// A reasonable interpretation of that is to stop a list of mutations after the first error -
 		// which seems like the natural semantics and is what we enforce here.
+		glog.Infof("=== [GraphQL Flow] RequestResolver.Resolve - Starting mutation resolution for %d mutations ===", len(op.Mutations()))
+		for i, m := range op.Mutations() {
+			glog.Infof("=== [GraphQL Flow] RequestResolver.Resolve - Mutation[%d]: Name=%s, Type=%s ===", i, m.Name(), m.MutationType())
+		}
 		allSuccessful := true
 
-		for _, m := range op.Mutations() {
+		for idx, m := range op.Mutations() {
 			if !allSuccessful {
 				resp.WithError(x.GqlErrorf(
 					"Mutation %s was not executed because of a previous error.",
@@ -587,10 +605,14 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) (
 				continue
 			}
 
+			glog.Infof("=== [GraphQL Flow] RequestResolver.Resolve - Calling mutationResolverFor(%s).Resolve() [%d/%d] ===", m.Name(), idx+1, len(op.Mutations()))
 			var res *Resolved
 			res, allSuccessful = r.resolvers.mutationResolverFor(m).Resolve(ctx, m)
+			glog.Infof("=== [GraphQL Flow] RequestResolver.Resolve - Completed mutation resolution for %s, success=%v ===", m.Name(), allSuccessful)
 			addResult(resp, res)
 		}
+		glog.Infof("=== [GraphQL Flow] RequestResolver.Resolve - All mutations completed ===")
+
 	case op.IsSubscription():
 		resolveQueries()
 	}

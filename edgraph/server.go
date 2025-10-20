@@ -1229,35 +1229,58 @@ func Init() {
 	maxPendingQueries = x.Config.Limit.GetInt64("max-pending-queries")
 }
 
+// doQuery is the central handler for both DQL and GraphQL queries/mutations.
+// This is called from QueryGraphQL (for GraphQL) and QueryNoGrpc (for DQL).
+//
+// Flow:
+// 1. Load balancing: Check if server can handle more requests
+// 2. Metrics tracking: Track GraphQL vs DQL request counts
+// 3. Request validation: Parse and authorize the request
+// 4. Query execution: Process the query/mutation through the query engine
+// 5. Response formatting: Convert results to JSON/RDF and attach latency metrics
 func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response, rerr error) {
+	// === PHASE 1: Request Context Validation ===
+	// Check if context has already been cancelled before processing
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
+
+	// === PHASE 2: Load Balancing & Rate Limiting ===
+	// Track pending queries to prevent server overload
+	// Increment counter now, decrement when done
 	defer atomic.AddInt64(&pendingQueries, -1)
 	if val := atomic.AddInt64(&pendingQueries, 1); val > maxPendingQueries {
 		return nil, serverOverloadErr
 	}
 
+	// === PHASE 3: Request Type Identification & Metrics ===
+	// Determine if this is a GraphQL or DQL request for metrics tracking
 	isGraphQL, _ := ctx.Value(IsGraphql).(bool)
 	if isGraphQL {
 		atomic.AddUint64(&numGraphQL, 1)
 	} else {
 		atomic.AddUint64(&numDQL, 1)
 	}
+
+	// Initialize latency tracking for performance monitoring
 	l := &query.Latency{}
 	l.Start = time.Now()
 
+	// Log the incoming request in DQL form (both GraphQL and DQL requests are in DQL here)
 	if bool(glog.V(3)) || worker.LogDQLRequestEnabled() {
 		glog.Infof("Got a query, DQL form: %+v %+v at %+v",
 			req.req.Query, req.req.Mutations, l.Start.Format(time.RFC3339))
 	}
 
+	// Determine if this request contains mutations (vs just queries)
 	isMutation := len(req.req.Mutations) > 0
 	methodRequest := methodQuery
 	if isMutation {
 		methodRequest = methodMutate
 	}
 
+	// === PHASE 4: Distributed Tracing Setup ===
+	// Set up OpenTelemetry tracing for observability across services
 	var measurements []ostats.Measurement
 	ctx, span := otel.Tracer("").Start(ctx, methodRequest)
 	if ns, err := x.ExtractNamespace(ctx); err == nil {
@@ -1265,6 +1288,7 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response,
 	}
 
 	ctx = x.WithMethod(ctx, methodRequest)
+	// Defer function to record metrics and end span when request completes
 	defer func() {
 		span.End()
 		v := x.TagValueStatusOK
@@ -1277,10 +1301,14 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response,
 		ostats.Record(ctx, measurements...)
 	}()
 
+	// === PHASE 5: Health Check ===
+	// Ensure the server is healthy before processing
 	if rerr = x.HealthCheck(); rerr != nil {
 		return
 	}
 
+	// === PHASE 6: Request Validation ===
+	// Ensure request has either a query or mutation
 	req.req.Query = strings.TrimSpace(req.req.Query)
 	isQuery := len(req.req.Query) != 0
 	if !isQuery && !isMutation {
@@ -1288,6 +1316,8 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response,
 		return nil, errors.Errorf("empty request")
 	}
 
+	// === PHASE 7: Metrics Recording ===
+	// Record query/mutation specific metrics
 	span.AddEvent("Request received",
 		trace.WithAttributes(attribute.String("Query", req.req.Query)))
 	if isQuery {
@@ -1300,6 +1330,8 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response,
 		ostats.Record(ctx, x.NumMutations.M(1))
 	}
 
+	// === PHASE 8: Root Namespace Authorization ===
+	// Only superadmin can perform galaxy-wide operations (across all namespaces)
 	if req.doAuth == NeedAuthorize && x.IsRootNsOperation(ctx) {
 		// Only the guardian of the galaxy can do a galaxy wide query/mutation. This operation is
 		// needed by live loader.
@@ -1310,32 +1342,45 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response,
 		}
 	}
 
+	// === PHASE 9: Query Context Construction ===
+	// Build the query context which carries all information needed for execution
 	qc := &queryContext{
 		req:      req.req,
 		latency:  l,
 		span:     span,
 		graphql:  isGraphQL,
-		gqlField: req.gqlField,
+		gqlField: req.gqlField, // Non-nil only for GraphQL requests
 	}
+
+	// === PHASE 10: Request Parsing ===
+	// Parse the DQL query string into internal query structure
+	// This converts the query string into a parsed AST representation
 	if rerr = parseRequest(ctx, qc); rerr != nil {
 		return
 	}
 
+	// === PHASE 11: Authorization Check ===
+	// Check ACL permissions for the parsed query/mutation
 	if req.doAuth == NeedAuthorize {
 		if rerr = authorizeRequest(ctx, qc); rerr != nil {
 			return
 		}
 	}
 
+	// === PHASE 12: Transaction Timestamp Assignment ===
 	// We use defer here because for queries, startTs will be
 	// assigned in the processQuery function called below.
 	defer annotateStartTs(qc.span, qc.req.StartTs)
 	// For mutations, we update the startTs if necessary.
+	// Mutations need a timestamp upfront, queries can get it lazily
 	if isMutation && req.req.StartTs == 0 {
 		start := time.Now()
 		req.req.StartTs = worker.State.GetTimestamp(false)
 		qc.latency.AssignTimestamp = time.Since(start)
 	}
+
+	// === PHASE 13: ACL Transaction Hash Setup ===
+	// If ACL is enabled, attach a hash to the transaction for validation
 	if x.WorkerConfig.AclEnabled {
 		ns, err := x.ExtractNamespace(ctx)
 		if err != nil {
@@ -1349,6 +1394,9 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response,
 		}()
 	}
 
+	// === PHASE 14: Query Execution ===
+	// Execute the query portion (if any) through the query engine
+	// This is where the actual graph traversal happens via query.Request.Process()
 	var gqlErrs error
 	if resp, rerr = processQuery(ctx, qc); rerr != nil {
 		// if rerr is just some error from GraphQL encoding, then we need to continue the normal
@@ -1361,6 +1409,9 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response,
 			return
 		}
 	}
+
+	// === PHASE 15: Mutation Execution ===
+	// Execute the mutation portion (if any)
 	// if it were a mutation, simple or upsert, in any case gqlErrs would be empty as GraphQL JSON
 	// is formed only for queries. So, gqlErrs can have something only in the case of a pure query.
 	// So, safe to ignore gqlErrs and not return that here.
@@ -1372,6 +1423,8 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response,
 	// Remove the namespace from the response.
 	// resp.Txn.Preds = x.ParseAttrList(resp.Txn.Preds)
 
+	// === PHASE 16: Response Completion ===
+	// Attach latency metrics to the response for client visibility
 	// TODO(martinmr): Include Transport as part of the latency. Need to do
 	// this separately since it involves modifying the API protos.
 	resp.Latency = &api.Latency{
@@ -1384,8 +1437,17 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response,
 	return resp, gqlErrs
 }
 
+// processQuery executes the query portion of a request and returns the results.
+// This handles both pure queries and the query part of upsert mutations.
+//
+// Flow:
+// 1. Timestamp assignment: Get a read timestamp for MVCC
+// 2. Query execution: Process the query through the graph query engine
+// 3. Result formatting: Convert subgraphs to JSON/RDF based on request format
 func processQuery(ctx context.Context, qc *queryContext) (*api.Response, error) {
 	resp := &api.Response{}
+	// === PHASE 1: Empty Query Check ===
+	// If there's no query string, return empty response with zero cost
 	if qc.req.Query == "" {
 		// No query, so make the query cost 0.
 		resp.Metrics = &api.Metrics{
@@ -1393,14 +1455,19 @@ func processQuery(ctx context.Context, qc *queryContext) (*api.Response, error) 
 		}
 		return resp, nil
 	}
+	// Check if context was cancelled before execution
 	if ctx.Err() != nil {
 		return resp, ctx.Err()
 	}
+
+	// === PHASE 2: Query Request Setup ===
+	// Build query.Request with parsed DQL and latency tracker
 	qr := query.Request{
 		Latency:  qc.latency,
-		DqlQuery: &qc.dqlRes,
+		DqlQuery: &qc.dqlRes, // Parsed DQL query structure from parseRequest()
 	}
 
+	// === PHASE 3: Transaction Timestamp Strategy ===
 	// Here we try our best effort to not contact Zero for a timestamp. If we succeed,
 	// then we use the max known transaction ts value (from ProcessDelta) for a read-only query.
 	// If we haven't processed any updates yet then fall back to getting TS from Zero.
@@ -1413,6 +1480,9 @@ func processQuery(ctx context.Context, qc *queryContext) (*api.Response, error) 
 		qc.span.AddEvent("", trace.WithAttributes(attribute.Bool("no", true)))
 	}
 
+	// === PHASE 4: Best Effort Query Handling ===
+	// Best effort queries use the local max timestamp without contacting Zero
+	// This improves performance but may read slightly stale data
 	if qc.req.BestEffort {
 		// Sanity: check that request is read-only too.
 		if !qc.req.ReadOnly {
@@ -1424,6 +1494,9 @@ func processQuery(ctx context.Context, qc *queryContext) (*api.Response, error) 
 		qr.Cache = worker.NoCache
 	}
 
+	// === PHASE 5: Timestamp Assignment from Zero ===
+	// If StartTs not yet assigned, get one from Zero server
+	// This ensures snapshot isolation (MVCC) - query sees consistent state
 	if qc.req.StartTs == 0 {
 		assignTimestampStart := time.Now()
 		qc.req.StartTs = worker.State.GetTimestamp(qc.req.ReadOnly)
@@ -1433,14 +1506,23 @@ func processQuery(ctx context.Context, qc *queryContext) (*api.Response, error) 
 	qr.ReadTs = qc.req.StartTs
 	resp.Txn = &api.TxnContext{StartTs: qc.req.StartTs}
 
-	// Core processing happens here.
+	// === PHASE 6: Core Query Execution ===
+	// This is where the actual graph traversal happens!
+	// query.Request.Process() performs:
+	// - Graph traversal through predicates
+	// - Reading data from Badger
+	// - Applying filters and sorting
+	// - Building result subgraphs
 	er, err := qr.Process(ctx)
 
+	// Log query completion for debugging
 	if bool(glog.V(3)) || worker.LogDQLRequestEnabled() {
 		glog.Infof("Finished a query that started at: %+v",
 			qr.Latency.Start.Format(time.RFC3339))
 	}
 
+	// === PHASE 7: Error Handling ===
+	// If query execution failed, log and return error
 	if err != nil {
 		if bool(glog.V(3)) {
 			glog.Infof("Error processing query: %+v\n", err.Error())
@@ -1448,10 +1530,17 @@ func processQuery(ctx context.Context, qc *queryContext) (*api.Response, error) 
 		return resp, errors.Wrap(err, "")
 	}
 
+	// === PHASE 8: Result Formatting ===
+	// Convert the execution result (er) into the requested output format
+
+	// Case 1: Schema Introspection Query
+	// Handle special schema/type queries (e.g., "schema {}" queries)
 	if len(er.SchemaNode) > 0 || len(er.Types) > 0 {
+		// Check if user has permission to see schema
 		if err = authorizeSchemaQuery(ctx, &er); err != nil {
 			return resp, err
 		}
+		// Sort results for consistent output
 		sort.Slice(er.SchemaNode, func(i, j int) bool {
 			return er.SchemaNode[i].Predicate < er.SchemaNode[j].Predicate
 		})
@@ -1459,6 +1548,7 @@ func processQuery(ctx context.Context, qc *queryContext) (*api.Response, error) 
 			return er.Types[i].TypeName < er.Types[j].TypeName
 		})
 
+		// Build schema response
 		respMap := make(map[string]interface{})
 		if len(er.SchemaNode) > 0 {
 			respMap["schema"] = er.SchemaNode
@@ -1467,19 +1557,30 @@ func processQuery(ctx context.Context, qc *queryContext) (*api.Response, error) 
 			respMap["types"] = formatTypes(er.Types)
 		}
 		resp.Json, err = json.Marshal(respMap)
+
+	// Case 2: RDF Format Request
+	// Convert subgraphs to RDF triples (subject-predicate-object format)
 	} else if qc.req.RespFormat == api.Request_RDF {
 		resp.Rdf, err = query.ToRDF(qc.latency, er.Subgraphs)
+
+	// Case 3: JSON Format (default)
+	// Convert subgraphs to JSON (GraphQL-style nested objects)
+	// qc.gqlField is non-nil for GraphQL requests, which need special handling
 	} else {
 		resp.Json, err = query.ToJson(ctx, qc.latency, er.Subgraphs, qc.gqlField)
 	}
+
+	// === PHASE 9: Encoding Error Handling ===
 	// if err is just some error from GraphQL encoding, then we need to continue the normal
 	// execution ignoring the error as we still need to assign metrics and latency info to resp.
 	if err != nil && (qc.gqlField == nil || !x.IsGqlErrorList(err)) {
 		return resp, err
 	}
+	// Add response to trace for observability
 	qc.span.AddEvent("Response",
 		trace.WithAttributes(attribute.String("response", string(resp.Json))))
 
+	// === PHASE 10: Variable Resolution for Mutations ===
 	// varToUID contains a map of variable name to the uids corresponding to it.
 	// It is used later for constructing set and delete mutations by replacing
 	// variables with the actual uids they correspond to.

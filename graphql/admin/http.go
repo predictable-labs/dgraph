@@ -217,51 +217,92 @@ func (gh *graphqlHandler) Handler() http.Handler {
 	}, gh)
 }
 
-// ServeHTTP handles GraphQL queries and mutations that get resolved
-// via GraphQL->Dgraph->GraphQL.  It writes a valid GraphQL JSON response
-// to w.
+// ServeHTTP is the HTTP entry point for all GraphQL requests.
+// This is where GraphQL queries and mutations enter the system before being
+// resolved via GraphQL->Dgraph->GraphQL pipeline.
+//
+// Flow:
+// 1. Parse HTTP request to extract GraphQL query/mutation
+// 2. Validate and authorize the request
+// 3. Resolve through GraphQL schema and execute against Dgraph
+// 4. Write JSON response back to client
 func (gh *graphqlHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// === PHASE 1: Distributed Tracing Setup ===
+	// Start OpenTelemetry span for this HTTP request
 	ctx, span := trace.StartSpan(r.Context(), "handler")
 	defer span.End()
 
+	// === PHASE 2: Namespace Extraction & Validation ===
+	// Extract namespace from header (for multi-tenancy support)
 	ns, _ := strconv.ParseUint(r.Header.Get("resolver"), 10, 64)
+	glog.Infof("=== [GraphQL Flow] ServeHTTP - Entry Point - Method: %s, Path: %s, Namespace: %d ===", r.Method, r.URL.Path, ns)
 	glog.Infof("namespace: %d. Got GraphQL request over HTTP.", ns)
+
+	// Validate that GraphQL resolver is initialized for this namespace
 	if err := gh.isValid(ns); err != nil {
 		glog.Errorf("namespace: %d. graphqlHandler not initialised: %s", ns, err)
 		WriteErrorResponse(w, r, errors.New(resolve.ErrInternal))
 		return
 	}
 
+	// === PHASE 3: Resolver Lookup ===
+	// Get the GraphQL resolver for this namespace (each namespace has its own schema/resolver)
 	gh.resolverMux.RLock()
 	resolver := gh.resolver[ns]
 	gh.resolverMux.RUnlock()
 
+	// === PHASE 4: CORS Headers Setup ===
+	// Add dynamic CORS headers based on schema configuration
 	addDynamicHeaders(resolver, r.Header.Get("Origin"), w)
 	if r.Method == http.MethodOptions {
 		// for OPTIONS, we only need to send the headers
 		return
 	}
 
+	// === PHASE 5: Authentication Context Setup ===
 	// Pass in PoorMan's auth, ACL and IP information if present.
+	// Attach JWT tokens, IP address, and namespace to context for authorization checks
 	ctx = x.AttachAccessJwt(ctx, r)
 	ctx = x.AttachRemoteIP(ctx, r)
 	ctx = x.AttachAuthToken(ctx, r)
 	ctx = x.AttachJWTNamespace(ctx)
 
+	// === PHASE 6: HTTP Request Parsing ===
+	// Parse HTTP request body/params into GraphQL request structure
+	// Handles both GET (query in URL params) and POST (query in body) requests
 	var res *schema.Response
 	gqlReq, err := getRequest(r)
 
 	if err != nil {
+		glog.Errorf("=== [GraphQL Flow] ServeHTTP - Error getting request: %v ===", err)
 		WriteErrorResponse(w, r, err)
 		return
 	}
 
+	glog.Infof("=== [GraphQL Flow] ServeHTTP - Parsed Request - Query: %s, OperationName: %s ===", gqlReq.Query, gqlReq.OperationName)
+
+	// === PHASE 7: Persisted Query Handling ===
+	// If request uses persisted queries (query identified by hash), resolve the actual query
 	if err = edgraph.ProcessPersistedQuery(ctx, gqlReq); err != nil {
+		glog.Errorf("=== [GraphQL Flow] ServeHTTP - Error processing persisted query: %v ===", err)
 		WriteErrorResponse(w, r, err)
 		return
 	}
 
+	// === PHASE 8: GraphQL Resolution ===
+	// This is the core: resolve the GraphQL request through the entire pipeline
+	// resolver.Resolve() will:
+	// - Parse GraphQL query/mutation
+	// - Validate against schema
+	// - Rewrite to DQL (Dgraph Query Language)
+	// - Execute against Dgraph
+	// - Format response
+	glog.Infof("=== [GraphQL Flow] ServeHTTP - Calling resolver.Resolve() ===")
 	res = resolver.Resolve(ctx, gqlReq)
+	glog.Infof("=== [GraphQL Flow] ServeHTTP - Resolver completed, writing response ===")
+
+	// === PHASE 9: Response Writing ===
+	// Write the GraphQL response as JSON, with optional gzip compression
 	write(w, res, strings.Contains(r.Header.Get("Accept-Encoding"), "gzip"))
 }
 
