@@ -14,7 +14,7 @@ import (
 	"github.com/hypermodeinc/dgraph/v25/protos/pb"
 )
 
-const sizeOfBucket = 14
+const sizeOfBucket = 144
 
 func (l *List) ApproximateSize() uint64 {
 	if l == nil {
@@ -29,13 +29,18 @@ func (l *List) ApproximateSize() uint64 {
 		1*8 + // mutation map pointer  consists of 1 word.
 		2*8 + // minTs and maxTs take 1 word each.
 		3*8 + // array take 3 words. so key array is 3 words.
+		3*8 + // array take 3 words. so cache array is 3 words.
 		1*8 // So far 11 words, in order to round the slab we're adding one more word.
 	// so far basic struct layout has been calculated.
 
-	// Add each entry size of key array.
-	size += uint64(cap(l.key))
+	// add byte array memory
+	size += uint64(cap(l.key)) + uint64(cap(l.cache))
 
 	size += approxPostingListSize(l.plist)
+
+	if l.mutationMap != nil {
+		size += l.mutationMap.ApproximateSize()
+	}
 
 	return size
 }
@@ -58,7 +63,7 @@ func approxPostingListSize(list *pb.PostingList) uint64 {
 	size += uint64(cap(list.Postings)) * 8
 	for _, p := range list.Postings {
 		// add the size of each posting.
-		size += calculatePostingSize(p) * uint64(len(list.Postings))
+		size += calculatePostingSize(p) * uint64(cap(list.Postings))
 		break
 	}
 
@@ -88,12 +93,16 @@ func (m *MutableLayer) ApproximateSize() uint64 {
 
 	// Add each entry size of committedEntries.
 	size += uint64(len(m.committedEntries)) * 8
+	for _, v := range m.committedUids {
+		size += calculatePostingSize(v) * uint64(len(m.committedEntries))
+		break
+	}
 
-	// Add each entry size of currentEntries.
-	size += uint64(len(m.currentEntries.Postings)) * 8
+	size += approxPostingListSize(m.currentEntries)
+	size += approxPostingListSize(m.lastEntry)
 
-	// Add each entry size of calculatedUids.
-	size += uint64(len(m.calculatedUids)) * 8
+	size += uint64(len(m.currentUids)) * 8
+	size += uint64(cap(m.calculatedUids)) * 8
 
 	return size
 }
